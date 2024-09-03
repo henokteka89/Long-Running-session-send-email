@@ -1,0 +1,56 @@
+CREATE PROCEDURE dbo.usp_CheckLongRunningQueries
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @email_subject NVARCHAR(255);
+    DECLARE @email_body NVARCHAR(MAX);
+
+    -- Find sessions running for more than 5 minutes
+    SELECT 
+        s.session_id,
+        r.start_time,
+        r.status,
+        r.command,
+        r.sql_handle,
+        DB_NAME(r.database_id) AS database_name,
+        r.wait_type,
+        r.wait_time,
+        r.blocking_session_id,
+        r.cpu_time,
+        r.total_elapsed_time / 60000 AS elapsed_minutes,
+        s.host_name,
+        s.program_name,
+        s.login_name,
+        SUBSTRING(qt.text, r.statement_start_offset / 2 + 1,
+        (CASE WHEN r.statement_end_offset = -1 THEN LEN(CONVERT(NVARCHAR(MAX), qt.text)) * 2 
+              ELSE r.statement_end_offset END - r.statement_start_offset) / 2 + 1) AS query_text
+    INTO #LongRunningQueries
+    FROM sys.dm_exec_requests r
+    JOIN sys.dm_exec_sessions s ON r.session_id = s.session_id
+    CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS qt
+    WHERE r.total_elapsed_time > 300000; -- 300000 milliseconds = 5 minutes
+
+    IF EXISTS (SELECT 1 FROM #LongRunningQueries)
+    BEGIN
+        -- Prepare email content
+        SET @email_subject = 'Long Running Queries Detected';
+        SET @email_body = 'The following queries have been running for more than 5 minutes:' + CHAR(13) + CHAR(10);
+
+        SELECT @email_body = @email_body + 'Session ID: ' + CAST(session_id AS NVARCHAR(10)) + CHAR(13) + CHAR(10) +
+            'Start Time: ' + CAST(start_time AS NVARCHAR(30)) + CHAR(13) + CHAR(10) +
+            'Elapsed Minutes: ' + CAST(elapsed_minutes AS NVARCHAR(10)) + CHAR(13) + CHAR(10) +
+            'Query Text: ' + query_text + CHAR(13) + CHAR(10) + CHAR(13) + CHAR(10)
+        FROM #LongRunningQueries;
+
+        -- Send email
+        EXEC msdb.dbo.sp_send_dbmail
+            @profile_name = 'YourMailProfile',
+            @recipients = 'dba_team@yourdomain.com',
+            @subject = @email_subject,
+            @body = @email_body;
+    END
+
+    DROP TABLE #LongRunningQueries;
+END
+GO
